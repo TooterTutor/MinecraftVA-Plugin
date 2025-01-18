@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -24,36 +26,16 @@ namespace VoiceAttackMinecraftPlugin
         }
 
         private const string HostName = "localhost";
-        private const int Port = 25565;
+        private const int DefaultPort = 28463;
+
+        private static int Port; // Store the current port
 
         public static void VA_Init1(dynamic vaProxy)
         {
             vaProxy.WriteToLog("Minecraft VoiceAttack Plugin initializing...", "green");
 
-            const int maxRetries = 3;
-            const int retryDelayMs = 5000; // 5 seconds
-
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
-            {
-                try
-                {
-                    vaProxy.WriteToLog($"Attempt {attempt}: Trying to connect to Minecraft mod...", "blue");
-                    UpdateMappings(vaProxy);
-                    vaProxy.WriteToLog("Minecraft VoiceAttack Plugin initialized successfully", "green");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    vaProxy.WriteToLog($"Initialization attempt {attempt} failed: {ex.Message}", "yellow");
-                    if (attempt < maxRetries)
-                    {
-                        vaProxy.WriteToLog($"Retrying in {retryDelayMs / 1000} seconds...", "yellow");
-                        System.Threading.Thread.Sleep(retryDelayMs);
-                    }
-                }
-            }
-
-            vaProxy.WriteToLog("Minecraft VoiceAttack Plugin initialization failed after maximum retries", "red");
+            // Start handshake to get the port
+            Task.Run(() => Handshake(vaProxy)).Wait();
         }
 
         public static void VA_Exit1(dynamic vaProxy)
@@ -73,9 +55,6 @@ namespace VoiceAttackMinecraftPlugin
                 case "execute_keybind":
                     string keybind = vaProxy.GetText("keybind");
                     ExecuteMethod(vaProxy, keybind);
-                    break;
-                case "create_voice_commands":
-                    CreateVoiceCommands(vaProxy);
                     break;
                 default:
                     vaProxy.WriteToLog($"Unknown context: {context}", "red");
@@ -142,109 +121,121 @@ namespace VoiceAttackMinecraftPlugin
             }
         }
 
-        private static void CreateVoiceCommands(dynamic vaProxy)
+        private static string SendCommand(JObject command, dynamic vaProxy)
         {
             try
             {
-                string response = SendCommand(new JObject
-                {
-                    ["action"] = "getMappings"
-                }, vaProxy);
-
-                Dictionary<string, string> mappings = JsonConvert.DeserializeObject<Dictionary<string, string>>(response);
-
-                if (mappings == null || mappings.Count == 0)
-                {
-                    vaProxy.WriteToLog("Error: No mappings received or unable to deserialize JSON", "red");
-                    return;
-                }
-
-                int createdCommands = 0;
-                List<string> createdCommandNames = new List<string>();
-
-                foreach (var mapping in mappings)
-                {
-                    string commandName = $"Minecraft {mapping.Key.Replace("key.", "").Replace("gui.", "").Replace("_", " ")}";
-                    string commandAction = $"[VoiceAttack.SetText(keybind, \"{mapping.Key}\")];" +
-                                           "[VoiceAttack.ExecuteCommand(Execute Minecraft Method)]";
-
-                    try
-                    {
-                        // Create or update the voice command
-                        vaProxy.Command.Add(commandName, commandAction, "Minecraft");
-
-                        createdCommandNames.Add(commandName);
-                        createdCommands++;
-                    }
-                    catch (Exception cmdEx)
-                    {
-                        vaProxy.WriteToLog($"Error creating/updating command '{commandName}': {cmdEx.Message}", "red");
-                    }
-                }
-
-                // Create or update the "Execute Minecraft Method" command
-                string executeMethodCommand = "Execute Minecraft Method";
-                string executeMethodAction = "[VoiceAttack.ExecuteExternalPlugin(MinecraftVA Plugin, execute_keybind, keybind)]";
-
-                try
-                {
-                    vaProxy.Command.Add(executeMethodCommand, executeMethodAction, "Minecraft");
-                    createdCommandNames.Add(executeMethodCommand);
-                }
-                catch (Exception cmdEx)
-                {
-                    vaProxy.WriteToLog($"Error creating/updating command '{executeMethodCommand}': {cmdEx.Message}", "red");
-                }
-
-                // Log the results
-                foreach (string cmdName in createdCommandNames)
-                {
-                    vaProxy.WriteToLog($"Created/Updated command: {cmdName}", "green");
-                }
-
-                vaProxy.WriteToLog($"Voice commands created/updated. Total commands: {createdCommands}", "green");
+                return SendCommandInternal(command, vaProxy);
             }
             catch (Exception ex)
             {
-                vaProxy.WriteToLog($"Error creating voice commands: {ex.Message}", "red");
-                vaProxy.WriteToLog($"Stack trace: {ex.StackTrace}", "red");
+                vaProxy.WriteToLog($"Error in SendCommand: {ex.GetType().Name} - {ex.Message}", "red");
+                vaProxy.WriteToLog("Attempting to reconnect using handshake...", "yellow");
+
+                // Attempt to reconnect using handshake
+                Task.Run(() => Handshake(vaProxy)).Wait();
+
+                // Retry sending the command
+                try
+                {
+                    return SendCommandInternal(command, vaProxy);
+                }
+                catch (Exception retryEx)
+                {
+                    vaProxy.WriteToLog($"Error in SendCommand after reconnect: {retryEx.GetType().Name} - {retryEx.Message}", "red");
+                    throw;
+                }
             }
         }
 
-        private static string SendCommand(JObject command, dynamic vaProxy)
+        private static string SendCommandInternal(JObject command, dynamic vaProxy)
         {
             using (TcpClient client = new TcpClient())
             {
+                vaProxy.WriteToLog("Attempting to connect to Minecraft mod...", "blue");
+                IAsyncResult ar = client.BeginConnect(HostName, Port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5))) // 5-second timeout
+                {
+                    throw new TimeoutException("Connection attempt timed out after 5 seconds");
+                }
+                client.EndConnect(ar);
+                //vaProxy.WriteToLog("Connected to Minecraft mod", "green");
+
+                using (NetworkStream stream = client.GetStream())
+                {
+                    //vaProxy.WriteToLog("Sending command to Minecraft mod...", "blue");
+                    byte[] data = Encoding.UTF8.GetBytes(command.ToString(Formatting.None) + "\n");
+                    stream.Write(data, 0, data.Length);
+
+                    //vaProxy.WriteToLog("Waiting for response from Minecraft mod...", "blue");
+                    using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        string response = reader.ReadToEnd().Trim();
+                        //vaProxy.WriteToLog($"Received response: {response}", "green");
+                        return response;
+                    }
+                }
+            }
+        }
+
+        private static async Task Handshake(dynamic vaProxy)
+        {
+            int retryCount = 0;
+            const int maxRetries = 5;
+            const int retryDelay = 5000; // 5 seconds
+
+            while (retryCount < maxRetries)
+            {
                 try
                 {
-                    vaProxy.WriteToLog("Attempting to connect to Minecraft mod...", "blue");
-                    IAsyncResult ar = client.BeginConnect(HostName, Port, null, null);
-                    if (!ar.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5))) // 5-second timeout
+                    using (TcpClient client = new TcpClient())
                     {
-                        throw new TimeoutException("Connection attempt timed out after 5 seconds");
-                    }
-                    client.EndConnect(ar);
-                    vaProxy.WriteToLog("Connected to Minecraft mod", "green");
-
-                    using (NetworkStream stream = client.GetStream())
-                    {
-                        vaProxy.WriteToLog("Sending command to Minecraft mod...", "blue");
-                        byte[] data = Encoding.UTF8.GetBytes(command.ToString(Formatting.None) + "\n");
-                        stream.Write(data, 0, data.Length);
-
-                        vaProxy.WriteToLog("Waiting for response from Minecraft mod...", "blue");
-                        using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                        //vaProxy.WriteToLog("Sending handshake to Minecraft mod...", "blue");
+                        await client.ConnectAsync(HostName, DefaultPort);
+                        using (NetworkStream stream = client.GetStream())
+                        using (StreamReader reader = new StreamReader(stream, new UTF8Encoding(false))) // Disable BOM
+                        using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) // Disable BOM
                         {
-                            string response = reader.ReadToEnd().Trim();
-                            vaProxy.WriteToLog($"Received response: {response}", "green");
-                            return response;
+                            JObject handshakeCommand = new JObject
+                            {
+                                ["command"] = "handshake"
+                            };
+                            await writer.WriteLineAsync(handshakeCommand.ToString(Formatting.None));
+                            //vaProxy.WriteToLog("Handshake command sent, waiting for response...", "blue");
+
+                            string response = await reader.ReadLineAsync();
+                            //vaProxy.WriteToLog($"Raw response from handshake: {response}", "blue");
+
+                            if (string.IsNullOrEmpty(response))
+                            {
+                                throw new Exception("Handshake response is empty");
+                            }
+
+                            JObject jsonResponse = JObject.Parse(response);
+                            if (!jsonResponse.ContainsKey("port"))
+                            {
+                                throw new Exception("Handshake response does not contain 'port'");
+                            }
+
+                            Port = jsonResponse["port"].Value<int>();
+                            vaProxy.WriteToLog($"Received port from handshake: {Port}", "green");
+                            return; // Exit the method after successfully receiving the port
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    vaProxy.WriteToLog($"Error in SendCommand: {ex.GetType().Name} - {ex.Message}", "red");
-                    throw;
+                    vaProxy.WriteToLog($"Error during handshake: {ex.Message}", "red");
+                    retryCount++;
+                    if (retryCount < maxRetries)
+                    {
+                        vaProxy.WriteToLog($"Retrying handshake... Attempt {retryCount}/{maxRetries}", "yellow");
+                        await Task.Delay(retryDelay);
+                    }
+                    else
+                    {
+                        vaProxy.WriteToLog("Max retries reached. Failed to receive port acknowledgment.", "red");
+                    }
                 }
             }
         }
