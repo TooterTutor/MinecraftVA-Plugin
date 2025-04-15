@@ -180,63 +180,49 @@ namespace VoiceAttackMinecraftPlugin
 
         private static async Task Handshake(dynamic vaProxy)
         {
-            int retryCount = 0;
-            const int maxRetries = 5;
-            const int retryDelay = 5000; // 5 seconds
+            TcpListener listener = new TcpListener(IPAddress.Any, DefaultPort);
+            listener.Start();
+            vaProxy.WriteToLog($"Listening for handshake on port {DefaultPort}...", "blue");
 
-            while (retryCount < maxRetries)
+            try
             {
-                try
+                using (TcpClient client = await listener.AcceptTcpClientAsync())
                 {
-                    using (TcpClient client = new TcpClient())
+                    vaProxy.WriteToLog("Connection established with Minecraft mod.", "green");
+                    using (NetworkStream stream = client.GetStream())
+                    using (StreamReader reader = new StreamReader(stream, new UTF8Encoding(false))) // Disable BOM
+                    using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) // Disable BOM
                     {
-                        //vaProxy.WriteToLog("Sending handshake to Minecraft mod...", "blue");
-                        await client.ConnectAsync(HostName, DefaultPort);
-                        using (NetworkStream stream = client.GetStream())
-                        using (StreamReader reader = new StreamReader(stream, new UTF8Encoding(false))) // Disable BOM
-                        using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true }) // Disable BOM
+                        JObject handshakeCommand = new JObject
                         {
-                            JObject handshakeCommand = new JObject
-                            {
-                                ["command"] = "handshake"
-                            };
-                            await writer.WriteLineAsync(handshakeCommand.ToString(Formatting.None));
-                            //vaProxy.WriteToLog("Handshake command sent, waiting for response...", "blue");
+                            ["status"] = "acknowledged"
+                        };
+                        await writer.WriteLineAsync(handshakeCommand.ToString(Formatting.None));
 
-                            string response = await reader.ReadLineAsync();
-                            //vaProxy.WriteToLog($"Raw response from handshake: {response}", "blue");
-
-                            if (string.IsNullOrEmpty(response))
-                            {
-                                throw new Exception("Handshake response is empty");
-                            }
-
-                            JObject jsonResponse = JObject.Parse(response);
-                            if (!jsonResponse.ContainsKey("port"))
-                            {
-                                throw new Exception("Handshake response does not contain 'port'");
-                            }
-
-                            Port = jsonResponse["port"].Value<int>();
-                            vaProxy.WriteToLog($"Received port from handshake: {Port}", "green");
-                            return; // Exit the method after successfully receiving the port
+                        string response = await reader.ReadLineAsync();
+                        if (string.IsNullOrEmpty(response))
+                        {
+                            throw new Exception("Handshake response is empty");
                         }
+
+                        JObject jsonResponse = JObject.Parse(response);
+                        if (!jsonResponse.ContainsKey("port"))
+                        {
+                            throw new Exception("Handshake response does not contain 'port'");
+                        }
+
+                        Port = jsonResponse["port"].Value<int>();
+                        vaProxy.WriteToLog($"Received port from handshake: {Port}", "green");
                     }
                 }
-                catch (Exception ex)
-                {
-                    vaProxy.WriteToLog($"Error during handshake: {ex.Message}", "red");
-                    retryCount++;
-                    if (retryCount < maxRetries)
-                    {
-                        vaProxy.WriteToLog($"Retrying handshake... Attempt {retryCount}/{maxRetries}", "yellow");
-                        await Task.Delay(retryDelay);
-                    }
-                    else
-                    {
-                        vaProxy.WriteToLog("Max retries reached. Failed to receive port acknowledgment.", "red");
-                    }
-                }
+            }
+            catch (Exception ex)
+            {
+                vaProxy.WriteToLog($"Error during handshake: {ex.Message}", "red");
+            }
+            finally
+            {
+                listener.Stop();
             }
         }
     }
